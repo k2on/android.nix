@@ -166,25 +166,10 @@ rec {
     let
       parent = dirOf projectDir;
       base = baseNameOf projectDir;
-    in
-    pkgs.stdenv.mkDerivation (finalAttrs:
-    mkBuildAttrs { inherit sdk gradle jdk ndkVersion nativeBuildInputs; } // {
-      inherit name src variant gradleUpdateTask buildPhase installPhase;
 
-      # There is no lockfile to vendor a Maven graph from, because working
-      # out what a gradle build fetches is a Turing-complete question; so
-      # nixpkgs answers it by running the build once behind a recording
-      # proxy and keeping what came back. `gradleDeps` is that recording.
-      mitmCache =
-        if mitmCache != null then mitmCache
-        else gradle.fetchDeps { pkg = finalAttrs.finalPackage; data = gradleDeps; };
-
-      # Preparing the project is `configurePhase`, not `buildPhase`, and
-      # that is load-bearing rather than tidiness. `fetchDeps`' update
-      # script runs `unpackPhase patchPhase configurePhase` and then gradle
-      # — it never calls `buildPhase`. With the preparation in `buildPhase`
-      # there would be no project for it to record from.
-      configurePhase = ''
+      # The same phase with and without a layer to put back, because the
+      # recording needs the one without; see `mitmCache` below.
+      configureWith = restore': ''
         runHook preConfigure
 
         # Emulated here too — gradle drives the NDK's clang, and CMake
@@ -198,8 +183,8 @@ rec {
         cd ${lib.escapeShellArg parent}
         ${sdkSetup { projectDir = base; inherit ndkVersion aapt2BuildTools; }}
 
-        ${lib.optionalString (restore != null) (gradleState.restoreGradleState {
-          state = restore;
+        ${lib.optionalString (restore' != null) (gradleState.restoreGradleState {
+          state = restore';
           roots = stateRoots;
           exclude = stateExclude;
         })}
@@ -210,6 +195,48 @@ rec {
 
         runHook postConfigure
       '';
+    in
+    pkgs.stdenv.mkDerivation (finalAttrs:
+    mkBuildAttrs { inherit sdk gradle jdk ndkVersion nativeBuildInputs; } // {
+      inherit name src variant gradleUpdateTask buildPhase installPhase;
+
+      # There is no lockfile to vendor a Maven graph from, because working
+      # out what a gradle build fetches is a Turing-complete question; so
+      # nixpkgs answers it by running the build once behind a recording
+      # proxy and keeping what came back. `gradleDeps` is that recording.
+      #
+      # What it records from is this build *without its state layer*, and that
+      # is the whole of why `configureWith` exists. `update-deps.nix` derives
+      # the recording from this package, and a `restore` puts the layer's
+      # store path in `configurePhase` — so realising the recording would
+      # first realise a layer that replays the very graph being recorded.
+      # Offline, from a lockfile that by definition does not have the thing
+      # being added, which makes the one case recording exists for — a new
+      # dependency — the one case it cannot do. It reads as the *build*
+      # failing to resolve an artifact that is plainly published.
+      #
+      # Recording without the layer is also the more honest graph: a build
+      # with nothing to restore fetches every artifact itself, so what comes
+      # back is everything the project needs rather than everything it missed.
+      mitmCache =
+        if mitmCache != null then mitmCache
+        else gradle.fetchDeps {
+          pkg = finalAttrs.finalPackage.overrideAttrs (_: {
+            configurePhase = configureWith null;
+            # Overridden so this expression is not reached again through the
+            # new package's own `finalAttrs`, which would not terminate.
+            # `update-deps.nix` sets it to the same thing for its own reasons.
+            mitmCache = "";
+          });
+          data = gradleDeps;
+        };
+
+      # Preparing the project is `configurePhase`, not `buildPhase`, and
+      # that is load-bearing rather than tidiness. `fetchDeps`' update
+      # script runs `unpackPhase patchPhase configurePhase` and then gradle
+      # — it never calls `buildPhase`. With the preparation in `buildPhase`
+      # there would be no project for it to record from.
+      configurePhase = configureWith restore;
     } // extraAttrs);
 
   # The layer: the same project built once with whatever it holds, and the
